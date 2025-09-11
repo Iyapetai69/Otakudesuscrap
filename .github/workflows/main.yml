@@ -1,0 +1,40 @@
+name: Daily Otakudesu Scraper
+
+on:
+  schedule:
+    # runs once per day at 00:00 Asia/Jakarta (UTC+7) -> cron uses UTC so 00:00 WIB = 17:00 UTC previous day
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper (all)
+        env:
+          OTAKUDESU_BASE_URL: ${{ secrets.OTAKUDESU_BASE_URL }}
+          RATE_LIMIT_SECONDS: '1.5'
+        run: |
+          python scraper.py all
+
+      - name: Commit outputs
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add outputs/*.json || true
+          if git diff --staged --quiet; then echo "No changes"; else git commit -m "chore: update scraped json" && git push; fi
