@@ -1,281 +1,191 @@
-import sys
-import os
-import json
-import time
-from datetime import datetime
-from typing import List, Dict, Any, Optional
 import requests
 from bs4 import BeautifulSoup
+import json
+import re
+import os
+import argparse
+import time
 
-# Configuration
-BASE_URL = "https://otakudesu.best"  # Hardcoded ke domain aktif terbaru
+BASE_URL = "https://otakudesu.best"
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-}
-RATE_LIMIT_SECONDS = 1.5  # Delay between requests to reduce rate limit
-OUTPUT_DIR = "outputs"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# Simple helper utils
-def _get_soup(url: str) -> BeautifulSoup:
-    print(f"GET: {url}")
-    res = requests.get(url, headers=HEADERS, timeout=20)
-    res.raise_for_status()
-    time.sleep(RATE_LIMIT_SECONDS)
-    return BeautifulSoup(res.text, "html.parser")
-
-def _write_json(name: str, data: Any):
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    path = os.path.join(OUTPUT_DIR, f"{name}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"scraped_at": ts, "data": data}, f, ensure_ascii=False, indent=2)
-    print(f"Saved -> {path}")
-
-# --- Selectors / parsing rules ---
-# These are conservative, best-effort selectors. If some fields are missing, code falls back gracefully.
-selectors = {
-    "home_item": {
-        "container": ".wrapper .anime_list, .listupd, .post-listing, .thumb",
-        "title": "a[href]",
-        "link": "a[href]",
-        "thumbnail": "img[src]",
-        "meta": ".episode, .ep, .meta"
-    },
-    "anime_detail": {
-        "title": ".post-title, h1, .detail .title",
-        "synopsis": ".sinopsis, .entry-content, .summary, .anime__sinopsis",
-        "info_rows": ".info-stats, .detail .spec, .dlopis, .anime-info"
-    },
-    "episodes_list": {
-        "container": ".episode_list, .eps, .list-episode, .episodelist",
-        "episode_item": "a[href]"
-    },
-    "episode_detail": {
-        "title": "h1, .episode-title",
-        "embed": "iframe[src], .player iframe, .embed-responsive iframe",
-        "download_links": ".download, .dlbutton a, .downloads a"
-    },
-    "genre_list": {
-        "container": ".post-listing, .anime_list, .wrapper",
-        "item": "a[href]"
-    }
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36"
 }
 
-# --- Scrapers ---
 
-def scrape_home(page: int = 1) -> List[Dict[str, Any]]:
-    """Scrape the home page (or page X) for list of recent anime/posts."""
-    url = f"{BASE_URL}/" if page == 1 else f"{BASE_URL}/page/{page}/"
-    soup = _get_soup(url)
-
-    items = []
-    # Attempt a few different container queries
-    candidates = soup.select('.listupd .venser, .post, .anime_list .anime, .thumb, .listupd li, .post-listing article')
-    if not candidates:
-        # fallback: find anchors inside main content
-        candidates = soup.select('main a[href]')
-
-    for c in candidates:
+def fetch(url, retries=3, delay=3):
+    for i in range(retries):
         try:
-            link_tag = c.select_one('a[href]')
-            title = link_tag.get_text(strip=True) if link_tag else (c.get('title') or c.get_text(strip=True))
-            href = link_tag['href'] if link_tag and link_tag.has_attr('href') else None
-            thumb = None
-            img = c.select_one('img')
-            if img and img.has_attr('src'):
-                thumb = img['src']
-            items.append({'title': title, 'url': href, 'thumbnail': thumb})
+            res = requests.get(url, headers=HEADERS, timeout=15)
+            if res.status_code == 200:
+                return res.text
         except Exception as e:
-            # skip malformed
-            continue
+            print(f"Fetch error: {e}, retry {i+1}/{retries}")
+        time.sleep(delay)
+    return None
 
-    _write_json('home', items)
-    return items
 
-def scrape_anime_detail(slug_or_url: str) -> Dict[str, Any]:
-    """Scrape anime detail page. Accept slug (relative) or full url."""
-    if slug_or_url.startswith('http'):
-        url = slug_or_url
-    else:
-        url = f"{BASE_URL}/anime/{slug_or_url}" if '/anime/' not in slug_or_url else f"{BASE_URL}/{slug_or_url.lstrip('/')}"
+def clean_text(text):
+    return re.sub(r"\s+", " ", text).strip() if text else ""
 
-    soup = _get_soup(url)
 
-    # title
-    title_tag = soup.select_one('h1, .post-title, .title')
-    title = title_tag.get_text(strip=True) if title_tag else None
+def parse_home(page=1):
+    url = f"{BASE_URL}/ongoing-anime/page/{page}/" if page > 1 else f"{BASE_URL}/ongoing-anime/"
+    html = fetch(url)
+    if not html:
+        return {"error": "gagal fetch home"}
+    soup = BeautifulSoup(html, "html.parser")
+    data = []
+    for li in soup.select(".venz ul li"):
+        title = clean_text(li.select_one("h2").get_text()) if li.select_one("h2") else ""
+        link = li.select_one("a")["href"] if li.select_one("a") else ""
+        thumb = li.select_one("img")["src"] if li.select_one("img") else ""
+        eps = clean_text(li.select_one(".epz").get_text()) if li.select_one(".epz") else ""
+        date = clean_text(li.select_one(".epztipe").get_text()) if li.select_one(".epztipe") else ""
+        data.append({
+            "title": title,
+            "slug": re.sub(r"^https://otakudesu\.best/anime/", "", link).strip("/"),
+            "link": link,
+            "thumbnail": thumb,
+            "episode": eps,
+            "status": date
+        })
+    return {"page": page, "results": data}
 
-    # synopsis
-    synopsis_tag = soup.select_one('.sinopsis, .entry-content, .summary, .anime__sinopsis')
-    synopsis = synopsis_tag.get_text(strip=True) if synopsis_tag else None
 
-    # other info like genre, status, type, producer
-    info = {}
-    # attempt to find rows of info in dl or ul
-    possible_info = soup.select('.post-content .info, .detail .spec, .anime_info, .dlopis, .post .meta')
-    for p in possible_info:
-        text = p.get_text(separator='|', strip=True)
-        # naive split key:value pairs
-        if ':' in text or '\n' in text or '|' in text:
-            parts = [x.strip() for x in text.split('|') if x.strip()]
-            for part in parts:
-                if ':' in part:
-                    k, v = part.split(':', 1)
-                    info[k.strip().lower()] = v.strip()
-
-    # genres - try to grab genre links
-    genres = [a.get_text(strip=True) for a in soup.select('a[href*="genre"], .genres a, .genre a')]
-
-    data = {
-        'title': title,
-        'url': url,
-        'synopsis': synopsis,
-        'info': info,
-        'genres': genres
+def parse_anime(slug):
+    url = f"{BASE_URL}/anime/{slug}/"
+    html = fetch(url)
+    if not html:
+        return {"error": "gagal fetch anime"}
+    soup = BeautifulSoup(html, "html.parser")
+    title = clean_text(soup.select_one(".jdlrx h1").get_text()) if soup.select_one(".jdlrx h1") else ""
+    thumb = soup.select_one(".fotoanime img")["src"] if soup.select_one(".fotoanime img") else ""
+    sinopsis = clean_text(soup.select_one(".sinopc").get_text()) if soup.select_one(".sinopc") else ""
+    genres = [a.get_text() for a in soup.select(".infozingle span a")]
+    episodes = []
+    for li in soup.select(".episodelist ul li"):
+        eps_a = li.select_one("a")
+        if eps_a:
+            episodes.append({
+                "title": clean_text(eps_a.get_text()),
+                "link": eps_a["href"],
+                "slug": eps_a["href"].rstrip("/").split("/")[-1]
+            })
+    return {
+        "title": title,
+        "thumbnail": thumb,
+        "synopsis": sinopsis,
+        "genres": genres,
+        "episodes": episodes
     }
 
-    _write_json(f'anime_detail_{slug_or_url.replace("/","_")}', data)
-    return data
 
-def scrape_episodes_list(slug_or_url: str) -> List[Dict[str, Any]]:
-    if slug_or_url.startswith('http'):
-        url = slug_or_url
-    else:
-        url = f"{BASE_URL}/anime/{slug_or_url}" if '/anime/' not in slug_or_url else f"{BASE_URL}/{slug_or_url.lstrip('/')}"
-
-    soup = _get_soup(url)
-    eps = []
-    # common pattern: list of episode links
-    containers = soup.select('.eps, .episode_list, .list-episode, .episodelist, .venser ul li')
-    if not containers:
-        containers = soup.select('a[href*="episode"], a[href*="/ep-"]')
-
-    # collect anchors
-    anchors = []
-    for c in containers:
-        anchors.extend(c.select('a[href]'))
-    # dedupe by href
-    seen = set()
-    for a in anchors:
-        href = a['href']
-        if href in seen: continue
-        seen.add(href)
-        title = a.get_text(strip=True)
-        eps.append({'title': title, 'url': href})
-
-    _write_json(f'episodes_{slug_or_url.replace("/","_")}', eps)
-    return eps
-
-def scrape_episode_detail(slug_or_url: str) -> Dict[str, Any]:
-    if slug_or_url.startswith('http'):
-        url = slug_or_url
-    else:
-        url = f"{BASE_URL}/episode/{slug_or_url}" if '/episode/' not in slug_or_url else f"{BASE_URL}/{slug_or_url.lstrip('/')}"
-
-    soup = _get_soup(url)
-
-    title = soup.select_one('h1, .episode-title')
-    title = title.get_text(strip=True) if title else None
-
-    # find iframe embed
-    iframe = soup.select_one('iframe[src], .player iframe')
-    embed_url = iframe['src'] if iframe and iframe.has_attr('src') else None
-
-    # find download links
-    dl_links = [a['href'] for a in soup.select('.download a, .dlbutton a, a[href*="download"], a[href*="drive.google"]') if a.has_attr('href')]
-
-    data = {
-        'title': title,
-        'url': url,
-        'embed_url': embed_url,
-        'download_links': dl_links
+def parse_episode(slug):
+    url = f"{BASE_URL}/episode/{slug}/"
+    html = fetch(url)
+    if not html:
+        return {"error": "gagal fetch episode"}
+    soup = BeautifulSoup(html, "html.parser")
+    title = clean_text(soup.select_one(".posttl").get_text()) if soup.select_one(".posttl") else ""
+    stream_url = soup.select_one("#pembed iframe")["src"] if soup.select_one("#pembed iframe") else ""
+    downloads = []
+    for a in soup.select(".download > ul > li a"):
+        downloads.append({"host": a.get_text(), "link": a["href"]})
+    return {
+        "title": title,
+        "stream_url": stream_url,
+        "downloads": downloads
     }
 
-    _write_json(f'episode_{slug_or_url.replace("/","_")}', data)
-    return data
 
-def scrape_genre_list(slug_or_url: str, page: int = 1) -> List[Dict[str, Any]]:
-    if slug_or_url.startswith('http'):
-        url = slug_or_url
-    else:
-        url = f"{BASE_URL}/genre/{slug_or_url}" if '/genre/' not in slug_or_url else f"{BASE_URL}/{slug_or_url.lstrip('/')} "
-    if page > 1:
-        url = url.rstrip('/') + f"/page/{page}/"
+def parse_batch(slug):
+    url = f"{BASE_URL}/batch/{slug}/"
+    html = fetch(url)
+    if not html:
+        return {"error": "gagal fetch batch"}
+    soup = BeautifulSoup(html, "html.parser")
+    title = clean_text(soup.select_one(".jdlrx h1").get_text()) if soup.select_one(".jdlrx h1") else ""
+    downloads = []
+    for li in soup.select(".batchlink ul li"):
+        for a in li.select("a"):
+            downloads.append({
+                "quality": clean_text(li.get_text().split()[0]),
+                "host": a.get_text(),
+                "link": a["href"]
+            })
+    return {"title": title, "downloads": downloads}
 
-    soup = _get_soup(url)
-    items = []
-    anchors = soup.select('.post-listing a[href], .anime_list a[href], .listupd a[href]')
-    for a in anchors:
-        href = a['href']
-        title = a.get_text(strip=True)
-        items.append({'title': title, 'url': href})
 
-    _write_json(f'genre_{slug_or_url.replace("/","_")}_p{page}', items)
-    return items
+def save_json(name, data):
+    os.makedirs("outputs", exist_ok=True)
+    path = os.path.join("outputs", f"{name}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"Saved {path}")
 
-def scrape_complete_anime(page: int = 1) -> List[Dict[str, Any]]:
-    url = f"{BASE_URL}/complete-anime/" if page == 1 else f"{BASE_URL}/complete-anime/page/{page}/"
-    soup = _get_soup(url)
-    items = []
-    anchors = soup.select('.post-listing a[href], .anime_list a[href], .listupd a[href]')
-    for a in anchors:
-        items.append({'title': a.get_text(strip=True), 'url': a['href']})
-    _write_json(f'complete_anime_p{page}', items)
-    return items
 
-def scrape_ongoing_anime() -> List[Dict[str, Any]]:
-    url = f"{BASE_URL}/ongoing-anime/"
-    soup = _get_soup(url)
-    items = []
-    anchors = soup.select('.post-listing a[href], .anime_list a[href], .listupd a[href]')
-    for a in anchors:
-        items.append({'title': a.get_text(strip=True), 'url': a['href']})
-    _write_json('ongoing_anime', items)
-    return items
+def run_all():
+    page = 1
+    all_anime = []
+    while True:
+        home = parse_home(page=page)
+        if "results" not in home or not home["results"]:
+            break
+        save_json(f"home_p{page}", home)
+        all_anime.extend(home["results"])
+        page += 1
 
-# --- CLI ---
+    for anime in all_anime:
+        slug = anime["slug"]
+        detail = parse_anime(slug)
+        save_json(f"anime_{slug}", detail)
 
-def usage():
-    print("Usage: python scraper.py <all|home|anime|episodes|episode|genre|complete|ongoing> [arg]")
+        # batch jika ada
+        batch = parse_batch(slug)
+        if "downloads" in batch and batch["downloads"]:
+            save_json(f"batch_{slug}", batch)
 
-if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        usage()
-        sys.exit(1)
+        # episodes
+        for ep in detail.get("episodes", []):
+            epslug = ep["slug"]
+            epdetail = parse_episode(epslug)
+            save_json(f"episode_{epslug}", epdetail)
 
-    cmd = sys.argv[1]
-    if cmd == 'all':
-        scrape_home()
-        scrape_complete_anime()
-        scrape_ongoing_anime()
-    elif cmd == 'home':
-        page = int(sys.argv[2]) if len(sys.argv) > 2 else 1
-        scrape_home(page)
-    elif cmd == 'anime':
-        if len(sys.argv) < 3:
-            print('Provide slug or url')
-            sys.exit(1)
-        scrape_anime_detail(sys.argv[2])
-    elif cmd == 'episodes':
-        if len(sys.argv) < 3:
-            print('Provide anime slug or url')
-            sys.exit(1)
-        scrape_episodes_list(sys.argv[2])
-    elif cmd == 'episode':
-        if len(sys.argv) < 3:
-            print('Provide episode slug or url')
-            sys.exit(1)
-        scrape_episode_detail(sys.argv[2])
-    elif cmd == 'genre':
-        if len(sys.argv) < 3:
-            print('Provide genre slug')
-            sys.exit(1)
-        page = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-        scrape_genre_list(sys.argv[2], page)
-    elif cmd == 'complete':
-        page = int(sys.argv[2]) if len(sys.argv) > 2 else 1
-        scrape_complete_anime(page)
-    elif cmd == 'ongoing':
-        scrape_ongoing_anime()
-    else:
-        usage()
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=["home", "anime", "episode", "batch", "all"])
+    parser.add_argument("--slug", help="slug anime/episode")
+    parser.add_argument("--page", type=int, default=1)
+    args = parser.parse_args()
+
+    if args.mode == "home":
+        data = parse_home(page=args.page)
+        save_json(f"home_p{args.page}", data)
+    elif args.mode == "anime":
+        if not args.slug:
+            print("butuh --slug")
+            return
+        data = parse_anime(args.slug)
+        save_json(f"anime_{args.slug}", data)
+    elif args.mode == "episode":
+        if not args.slug:
+            print("butuh --slug")
+            return
+        data = parse_episode(args.slug)
+        save_json(f"episode_{args.slug}", data)
+    elif args.mode == "batch":
+        if not args.slug:
+            print("butuh --slug")
+            return
+        data = parse_batch(args.slug)
+        save_json(f"batch_{args.slug}", data)
+    elif args.mode == "all":
+        run_all()
+
+
+if __name__ == "__main__":
+    main()
