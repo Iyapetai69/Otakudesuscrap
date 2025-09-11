@@ -4,6 +4,7 @@
 # BASE_URL hardcoded to otakudesu.best
 
 import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 import time
 import json
@@ -12,6 +13,7 @@ import re
 from urllib.parse import urljoin
 import sys
 import traceback
+import random
 
 # -------- CONFIG --------
 BASE_URL = "https://otakudesu.best"
@@ -31,25 +33,39 @@ OUT_EPISODE = OUT / "episode"
 for p in [OUT, OUT_HOME, OUT_ONGOING, OUT_GENRE, OUT_JADWAL, OUT_ANIME, OUT_EPISODES, OUT_EPISODE]:
     p.mkdir(parents=True, exist_ok=True)
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-}
+# -------- Headers loader --------
+def load_headers(file="headers.txt"):
+    with open(file, "r", encoding="utf-8") as f:
+        lines = f.read().strip().splitlines()
+    headers_list = [json.loads(line) for line in lines if line.strip()]
+    return headers_list
+
+HEADERS_LIST = load_headers("headers.txt")
+scraper = cloudscraper.create_scraper()
 
 # -------- Helpers --------
 def fetch(url, retries=RETRIES, timeout=TIMEOUT):
     for attempt in range(1, retries+1):
+        headers = random.choice(HEADERS_LIST)
         try:
-            print(f"[GET] {url} (attempt {attempt})")
-            r = requests.get(url, headers=HEADERS, timeout=timeout)
+            print(f"[GET] {url} (attempt {attempt}) UA={headers.get('User-Agent')}")
+            r = scraper.get(url, headers=headers, timeout=timeout)
             r.raise_for_status()
-            time.sleep(RATE_LIMIT)
+            time.sleep(RATE_LIMIT + random.random()*2)
             return r.text
         except Exception as e:
-            print(f"  fetch error: {e}")
-            if attempt == retries:
-                print("  giving up:", url)
-                return None
-            time.sleep(1)
+            print(f"  cloudscraper error: {e}, coba requests biasa...")
+            try:
+                r = requests.get(url, headers=headers, timeout=timeout)
+                r.raise_for_status()
+                time.sleep(RATE_LIMIT + random.random()*2)
+                return r.text
+            except Exception as e2:
+                print(f"  requests error: {e2}")
+                if attempt == retries:
+                    print("  giving up:", url)
+                    return None
+                time.sleep(2)
     return None
 
 def soup_from_url(url):
