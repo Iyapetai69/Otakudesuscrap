@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # scraper_all_fixed.py
 # Runs full scrape: home, ongoing (paged), genre list, jadwal, all anime details, all episodes details.
-# Improved to handle Cloudflare 403 errors
+# BASE_URL hardcoded to otakudesu.best
+# FIXED to handle Cloudflare 403 errors while keeping original selectors
 import requests
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -14,15 +15,13 @@ import sys
 import traceback
 import random
 import logging
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+# --- Undetected Chrome (for Python 3.11) ---
 import undetected_chromedriver as uc
+from selenium.webdriver.chrome.options import Options
 
 # -------- CONFIG --------
 BASE_URL = "https://otakudesu.best"
-RATE_LIMIT = 3.0         # Increased delay
+RATE_LIMIT = 3.0         # Increased delay to be more human-like
 RETRIES = 5              # More retries
 TIMEOUT = 30             # Longer timeout
 OUT = Path("outputs")
@@ -50,6 +49,7 @@ for p in [OUT, OUT_HOME, OUT_ONGOING, OUT_GENRE, OUT_JADWAL, OUT_ANIME, OUT_EPIS
 
 # -------- Headers loader --------
 def load_headers(file="headers.txt"):
+    # Default headers if file not found
     default_headers = [
         {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -62,14 +62,6 @@ def load_headers(file="headers.txt"):
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
             "Cache-Control": "max-age=0"
-        },
-        {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1"
         }
     ]
     
@@ -122,7 +114,7 @@ class ScrapingSession:
         self.session.headers.update(default_headers)
     
     def _init_selenium(self):
-        """Initialize Selenium WebDriver"""
+        """Initialize Undetected Chrome WebDriver"""
         try:
             options = uc.ChromeOptions()
             options.add_argument("--headless=new")
@@ -134,9 +126,9 @@ class ScrapingSession:
             
             self.driver = uc.Chrome(options=options)
             self.use_selenium = True
-            logger.info("Selenium WebDriver initialized successfully")
+            logger.info("Undetected Chrome WebDriver initialized successfully")
         except Exception as e:
-            logger.error(f"Failed to initialize Selenium: {e}")
+            logger.error(f"Failed to initialize Undetected Chrome: {e}")
             self.use_selenium = False
     
     def get(self, url, headers=None, timeout=30):
@@ -217,15 +209,15 @@ class ScrapingSession:
         
         if self.driver:
             try:
-                logger.info(f"Fetching with Selenium: {url}")
+                logger.info(f"Fetching with Undetected Chrome: {url}")
                 self.driver.get(url)
                 time.sleep(random.uniform(3, 7))  # Wait for page to load
                 return self.driver.page_source
             except Exception as e:
-                logger.error(f"Selenium failed: {e}")
+                logger.error(f"Undetected Chrome failed: {e}")
                 raise e
         else:
-            raise Exception("Selenium not available")
+            raise Exception("Undetected Chrome not available")
     
     def close(self):
         """Close all resources"""
@@ -301,7 +293,7 @@ def scrape_home():
     return results
 
 # -- Ongoing (paged) --
-def scrape_ongoing_pages(max_pages=50):  # Reduced max pages for testing
+def scrape_ongoing_pages(max_pages=200):
     page = 1
     all_items = []
     while True:
@@ -379,11 +371,16 @@ def scrape_jadwal():
     return jadwal
 
 # -- Anime detail + episodes list --
+# *** KEEPING ALL ORIGINAL SELECTORS AS REQUESTED ***
 def scrape_anime_detail_by_slug(slug):
     url = f"{BASE_URL}/anime/{slug}/"
     soup = soup_from_url(url)
     if not soup:
+        logger.warning(f"Failed to fetch anime detail page for {slug}")
         return None
+        
+    logger.info(f"Successfully fetched anime detail page for {slug}")
+    
     # Title: many variants exist; check common selectors
     title = None
     # try .infozin .infozingle p:first span pattern (from Next.js), then .jdlrx h1, then h1
@@ -442,6 +439,9 @@ def scrape_anime_detail_by_slug(slug):
         for a in soup.select("a[href*='/episode/'], a[href*='episode']"):
             href = a.get("href")
             episodes.append({"title": a.get_text(strip=True), "link": href, "slug": slug_from_url(href)})
+    
+    logger.info(f"Found {len(episodes)} episodes for anime {slug}")
+    
     data = {
         "title": title,
         "slug": slug,
@@ -456,11 +456,16 @@ def scrape_anime_detail_by_slug(slug):
     return data
 
 # -- Episode detail (embed + downloads) --
+# *** KEEPING ALL ORIGINAL SELECTORS AS REQUESTED ***
 def scrape_episode_detail_by_slug(slug):
     url = f"{BASE_URL}/episode/{slug}/"
     soup = soup_from_url(url)
     if not soup:
+        logger.warning(f"Failed to fetch episode detail page for {slug}")
         return None
+        
+    logger.info(f"Successfully fetched episode detail page for {slug}")
+    
     # title
     title_el = soup.select_one(".venutama .posttl, h1, .post-title")
     title = title_el.get_text(strip=True) if title_el else None
@@ -549,7 +554,9 @@ def run_all():
                 logger.info(f"[{i}/{len(slugs_list)}] Scraping anime detail: {slug}")
                 ad = scrape_anime_detail_by_slug(slug)
                 if not ad:
+                    logger.warning(f"No data returned for anime {slug}")
                     continue
+                logger.info(f"[{i}/{len(slugs_list)}] Successfully scraped anime detail: {slug} ({len(ad.get('episodes', []))} episodes)")
                 # add episode slugs
                 for ep in ad.get("episodes", []):
                     if ep.get("slug"):
@@ -571,7 +578,11 @@ def run_all():
             j += 1
             try:
                 logger.info(f"[{j}/{len(ep_queue_list)}] Scraping episode: {ep_slug}")
-                scrape_episode_detail_by_slug(ep_slug)
+                result = scrape_episode_detail_by_slug(ep_slug)
+                if result:
+                    logger.info(f"[{j}/{len(ep_queue_list)}] Successfully scraped episode: {ep_slug}")
+                else:
+                    logger.warning(f"[{j}/{len(ep_queue_list)}] Failed to scrape episode: {ep_slug}")
             except Exception as e:
                 logger.error(f"ERROR scraping episode {ep_slug}: {e}")
                 logger.debug(traceback.format_exc())
