@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-# scraper_all_fixed.py
-# Runs full scrape: home, ongoing (paged), genre list, jadwal, all anime details, all episodes details.
-# BASE_URL hardcoded to otakudesu.best
-# FIXED to handle Cloudflare 403 errors while keeping original selectors
+# scraper_all_optimized.py
+# Optimized full scrape for GitHub Actions: home, ongoing (paged), genre list, jadwal, all anime details, all episodes details.
+# Optimizations: Skip if file exists, cloudscraper priority with Selenium fallback, adaptive rate limit, better logging.
+
+import logging
 import requests
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -14,16 +15,22 @@ from urllib.parse import urljoin
 import sys
 import traceback
 import random
-import logging
-# --- Undetected Chrome (for Python 3.11) ---
-import undetected_chromedriver as uc
+
+# Selenium fallback
+from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, WebDriverException
+
+# -------- Logging Setup --------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # -------- CONFIG --------
 BASE_URL = "https://otakudesu.best"
-RATE_LIMIT = 3.0         # Increased delay to be more human-like
-RETRIES = 5              # More retries
-TIMEOUT = 30             # Longer timeout
+RATE_LIMIT = 2.5  # Adaptive: start low, increase if needed
+RETRIES = 5
+TIMEOUT = 45
+
 OUT = Path("outputs")
 OUT_HOME = OUT / "home"
 OUT_ONGOING = OUT / "ongoing"
@@ -33,241 +40,131 @@ OUT_ANIME = OUT / "anime"
 OUT_EPISODES = OUT / "episodes"
 OUT_EPISODE = OUT / "episode"
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('scraper.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
-
 for p in [OUT, OUT_HOME, OUT_ONGOING, OUT_GENRE, OUT_JADWAL, OUT_ANIME, OUT_EPISODES, OUT_EPISODE]:
     p.mkdir(parents=True, exist_ok=True)
 
-# -------- Headers loader --------
-def load_headers(file="headers.txt"):
-    # Default headers if file not found
-    default_headers = [
-        {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Cache-Control": "max-age=0"
-        }
+# -------- Headers generator --------
+def generate_headers():
+    base_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+        "Connection": "keep-alive",
+        "Referer": "https://www.google.com/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1"
+    }
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     ]
-    
+    headers_list = []
+    for ua in user_agents:
+        h = base_headers.copy()
+        h["User-Agent"] = ua
+        headers_list.append(h)
+    return headers_list
+
+HEADERS_LIST = generate_headers()
+
+# -------- Scraper instances --------
+scraper = cloudscraper.create_scraper(
+    browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False, 'desktop': True},
+    delay=10
+)
+
+def get_selenium_driver():
+    options = Options()
+    options.headless = True
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument(f"user-agent={random.choice(HEADERS_LIST)['User-Agent']}")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
     try:
-        with open(file, "r", encoding="utf-8") as f:
-            lines = f.read().strip().splitlines()
-        headers_list = [json.loads(line) for line in lines if line.strip()]
-        if headers_list:
-            return headers_list
-    except FileNotFoundError:
-        logger.warning(f"Headers file {file} not found, using default headers")
-    except Exception as e:
-        logger.warning(f"Error loading headers from {file}: {e}, using default headers")
-    
-    return default_headers
-
-HEADERS_LIST = load_headers("headers.txt")
-
-# -------- Browser Session Management --------
-class ScrapingSession:
-    def __init__(self):
-        self.session = None
-        self.driver = None
-        self.use_selenium = False
-        self._init_session()
-    
-    def _init_session(self):
-        """Initialize cloudscraper session with better settings"""
-        self.session = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'mobile': False
-            },
-            debug=False
-        )
-        
-        # Add default headers to session
-        default_headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Cache-Control": "max-age=0"
-        }
-        self.session.headers.update(default_headers)
-    
-    def _init_selenium(self):
-        """Initialize Undetected Chrome WebDriver"""
-        try:
-            options = uc.ChromeOptions()
-            options.add_argument("--headless=new")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--disable-blink-features=AutomationControlled")
-            options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            options.add_experimental_option('useAutomationExtension', False)
-            
-            self.driver = uc.Chrome(options=options)
-            self.use_selenium = True
-            logger.info("Undetected Chrome WebDriver initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize Undetected Chrome: {e}")
-            self.use_selenium = False
-    
-    def get(self, url, headers=None, timeout=30):
-        """Get page content with fallback mechanisms"""
-        # Try cloudscraper first
-        for attempt in range(RETRIES):
-            try:
-                # Randomize headers
-                if HEADERS_LIST:
-                    selected_headers = random.choice(HEADERS_LIST)
-                    if headers:
-                        selected_headers.update(headers)
-                    headers = selected_headers
-                
-                logger.info(f"[GET] {url} (attempt {attempt + 1})")
-                
-                response = self.session.get(url, headers=headers, timeout=timeout)
-                
-                # Check for Cloudflare challenge
-                if self._is_cloudflare_challenge(response):
-                    logger.warning("Cloudflare challenge detected")
-                    if not self.use_selenium:
-                        self._init_selenium()
-                    if self.use_selenium:
-                        return self._get_with_selenium(url)
-                    else:
-                        raise Exception("Cloudflare challenge detected, but Selenium not available")
-                
-                # Check if response is valid
-                if response.status_code == 200:
-                    return response.text
-                elif response.status_code == 403:
-                    logger.warning(f"403 Forbidden on attempt {attempt + 1}")
-                    if attempt == RETRIES - 1:
-                        # Last attempt - try selenium
-                        if not self.use_selenium:
-                            self._init_selenium()
-                        if self.use_selenium:
-                            return self._get_with_selenium(url)
-                        else:
-                            raise Exception(f"403 Forbidden after {RETRIES} attempts")
-                else:
-                    logger.warning(f"HTTP {response.status_code} on attempt {attempt + 1}")
-                    
-            except Exception as e:
-                logger.warning(f"Attempt {attempt + 1} failed: {e}")
-                if attempt == RETRIES - 1:
-                    # Last attempt - try selenium
-                    if not self.use_selenium:
-                        self._init_selenium()
-                    if self.use_selenium:
-                        return self._get_with_selenium(url)
-                    else:
-                        raise e
-            
-            # Random delay between attempts
-            time.sleep(random.uniform(2, 5))
-        
-        raise Exception("All attempts failed")
-    
-    def _is_cloudflare_challenge(self, response):
-        """Check if response contains Cloudflare challenge"""
-        if response.status_code in [403, 503]:
-            text = response.text.lower()
-            return any(indicator in text for indicator in [
-                'checking your browser',
-                'cloudflare',
-                'checking your browser before accessing',
-                'enable javascript',
-                'access denied'
-            ])
-        return False
-    
-    def _get_with_selenium(self, url):
-        """Get page content using Selenium"""
-        if not self.driver:
-            self._init_selenium()
-        
-        if self.driver:
-            try:
-                logger.info(f"Fetching with Undetected Chrome: {url}")
-                self.driver.get(url)
-                time.sleep(random.uniform(3, 7))  # Wait for page to load
-                return self.driver.page_source
-            except Exception as e:
-                logger.error(f"Undetected Chrome failed: {e}")
-                raise e
-        else:
-            raise Exception("Undetected Chrome not available")
-    
-    def close(self):
-        """Close all resources"""
-        if self.driver:
-            try:
-                self.driver.quit()
-            except:
-                pass
-
-# Initialize global scraping session
-scraper_session = ScrapingSession()
-
-# -------- Helpers --------
-def fetch(url, retries=RETRIES, timeout=TIMEOUT):
-    """Fetch URL with improved error handling"""
-    try:
-        html = scraper_session.get(url, timeout=timeout)
-        # Random delay to avoid rate limiting
-        time.sleep(random.uniform(RATE_LIMIT, RATE_LIMIT + 3))
-        return html
-    except Exception as e:
-        logger.error(f"Failed to fetch {url}: {e}")
+        driver = webdriver.Chrome(options=options)
+        return driver
+    except WebDriverException as e:
+        logger.error(f"Selenium init error: {e}")
         return None
 
+# -------- Optimized Fetch --------
+def fetch(url, retries=RETRIES, timeout=TIMEOUT):
+    for attempt in range(1, retries + 1):
+        headers = random.choice(HEADERS_LIST)
+        try:
+            logger.info(f"[CLOUDSCRAPER GET] {url} (attempt {attempt}) UA={headers.get('User-Agent')}")
+            r = scraper.get(url, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            time.sleep(RATE_LIMIT + random.uniform(1, 4))
+            return r.text
+        except requests.exceptions.HTTPError as he:
+            if he.response.status_code == 403:
+                logger.warning("403 detected, trying Selenium fallback...")
+                return fetch_with_selenium(url)
+            logger.error(f"HTTP error: {he}")
+        except Exception as e:
+            logger.error(f"Cloudscraper error: {e}")
+        if attempt == retries:
+            logger.error(f"Giving up on {url}")
+            return None
+        time.sleep(3 + random.random() * 3)
+
+def fetch_with_selenium(url):
+    driver = get_selenium_driver()
+    if not driver:
+        return None
+    try:
+        logger.info(f"[SELENIUM GET] {url}")
+        driver.get(url)
+        time.sleep(5 + random.uniform(1, 3))
+        html = driver.page_source
+        return html
+    except TimeoutException:
+        logger.error("Selenium timeout")
+    except Exception as e:
+        logger.error(f"Selenium error: {e}")
+    finally:
+        driver.quit()
+    return None
+
 def soup_from_url(url):
-    """Get BeautifulSoup object from URL"""
     html = fetch(url)
     if not html:
         return None
     return BeautifulSoup(html, "html.parser")
 
 def save_json(data, filename, folder):
-    """Save data to JSON file"""
     path = Path(folder) / filename
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        logger.info(f"[saved] {path}")
-    except Exception as e:
-        logger.error(f"Failed to save {path}: {e}")
+    if path.exists():
+        logger.info(f"[skip] {path} already exists")
+        return False
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    logger.info(f"[saved] {path}")
+    return True
 
 def slug_from_url(url):
-    """Extract slug from URL"""
     if not url:
         return None
     return url.rstrip("/").split("/")[-1]
 
 # -------- Scrapers --------
-# -- Home (root page shows ongoing block) --
 def scrape_home():
+    filename = "home.json"
+    if (OUT_HOME / filename).exists():
+        logger.info(f"Skipping home scrape: {filename} exists")
+        try:
+            return json.loads((OUT_HOME / filename).read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning(f"Corrupt file {filename}, rescraping...")
     soup = soup_from_url(BASE_URL)
     if not soup:
         return []
@@ -289,20 +186,26 @@ def scrape_home():
             "date": date.get_text(strip=True) if date else None
         }
         results.append(item)
-    save_json(results, "home.json", OUT_HOME)
+    save_json(results, filename, OUT_HOME)
     return results
 
-# -- Ongoing (paged) --
 def scrape_ongoing_pages(max_pages=200):
-    page = 1
     all_items = []
-    while True:
+    for page in range(1, max_pages + 1):
+        filename = f"ongoing_p{page}.json"
+        if (OUT_ONGOING / filename).exists():
+            logger.info(f"Skipping ongoing page {page}: {filename} exists")
+            try:
+                items = json.loads((OUT_ONGOING / filename).read_text(encoding="utf-8"))
+                all_items.extend(items)
+                continue
+            except Exception:
+                logger.warning(f"Corrupt file {filename}, rescraping...")
         url = f"{BASE_URL}/ongoing-anime/" if page == 1 else f"{BASE_URL}/ongoing-anime/page/{page}/"
         soup = soup_from_url(url)
         if not soup:
             break
         items = []
-        # main container: div.venz ul li (like home)
         for li in soup.select("div.venz ul li"):
             a = li.select_one("a")
             img = li.select_one("div.thumbz img")
@@ -313,51 +216,52 @@ def scrape_ongoing_pages(max_pages=200):
                 "link": a.get("href") if a and a.has_attr("href") else None,
                 "slug": slug_from_url(a.get("href")) if a and a.has_attr("href") else None,
                 "thumbnail": img.get("src") if img and img.has_attr("src") else None,
-                "latest_episode": ep.get_text(strip=True) if ep else None
-            }
-            items.append(item)
-        if not items:
-            break
-        save_json(items, f"ongoing_p{page}.json", OUT_ONGOING)
-        all_items.extend(items)
-        page += 1
-        if page > max_pages:
-            break
-    # dedupe by slug
-    seen = set()
-    unique = []
-    for it in all_items:
-        if not it.get("slug"): continue
-        if it["slug"] in seen: continue
-        seen.add(it["slug"])
-        unique.append(it)
-    save_json(unique, "ongoing_all_unique.json", OUT_ONGOING)
-    return unique
+            "latest_episode": ep.get_text(strip=True) if ep else None
+        }
+        items.append(item)
+    if not items:
+        break
+    save_json(items, filename, OUT_ONGOING)
+    all_items.extend(items)
+seen = set()
+unique = [it for it in all_items if it.get("slug") and it["slug"] not in seen and not seen.add(it["slug"])]
+save_json(unique, "ongoing_all_unique.json", OUT_ONGOING)
+return unique
 
-# -- Genre list --
 def scrape_genrelist():
+    filename = "genrelist.json"
+    if (OUT_GENRE / filename).exists():
+        logger.info(f"Skipping genre list: {filename} exists")
+        try:
+            return json.loads((OUT_GENRE / filename).read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning(f"Corrupt file {filename}, rescraping...")
     url = f"{BASE_URL}/genre-list/"
     soup = soup_from_url(url)
     if not soup:
         return []
     results = []
-    # site uses #venkonten .vezone ul.genres li a in earlier file; fallback to .genres li a
     for a in soup.select("#venkonten .vezone ul.genres li a, div.genres li a, .genres li a"):
         results.append({
             "name": a.get_text(strip=True),
             "link": a.get("href")
         })
-    save_json(results, "genrelist.json", OUT_GENRE)
+    save_json(results, filename, OUT_GENRE)
     return results
 
-# -- Jadwal rilis --
 def scrape_jadwal():
+    filename = "jadwalrilis.json"
+    if (OUT_JADWAL / filename).exists():
+        logger.info(f"Skipping jadwal: {filename} exists")
+        try:
+            return json.loads((OUT_JADWAL / filename).read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning(f"Corrupt file {filename}, rescraping...")
     url = f"{BASE_URL}/jadwal-rilis/"
     soup = soup_from_url(url)
     if not soup:
         return {}
     jadwal = {}
-    # files used div.jadwal-konten with h2 day and ul li entries
     for box in soup.select("div.jadwal-konten"):
         day_el = box.select_one("h2")
         day = day_el.get_text(strip=True) if day_el else "unknown"
@@ -367,32 +271,29 @@ def scrape_jadwal():
             if a and a.has_attr("href"):
                 items.append({"title": a.get_text(strip=True), "link": a.get("href")})
         jadwal[day] = items
-    save_json(jadwal, "jadwalrilis.json", OUT_JADWAL)
+    save_json(jadwal, filename, OUT_JADWAL)
     return jadwal
 
-# -- Anime detail + episodes list --
-# *** KEEPING ALL ORIGINAL SELECTORS AS REQUESTED ***
 def scrape_anime_detail_by_slug(slug):
+    filename = f"{slug}.json"
+    if (OUT_ANIME / filename).exists():
+        logger.info(f"Skipping anime {slug}: {filename} exists")
+        try:
+            return json.loads((OUT_ANIME / filename).read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning(f"Corrupt file {filename}, rescraping...")
     url = f"{BASE_URL}/anime/{slug}/"
     soup = soup_from_url(url)
     if not soup:
-        logger.warning(f"Failed to fetch anime detail page for {slug}")
         return None
-        
-    logger.info(f"Successfully fetched anime detail page for {slug}")
-    
-    # Title: many variants exist; check common selectors
     title = None
-    # try .infozin .infozingle p:first span pattern (from Next.js), then .jdlrx h1, then h1
     t = soup.select_one(".infozin .infozingle p:first-child span, .jdlrx h1, h1, .post-title")
     if t:
         title = t.get_text(strip=True).replace("Judul: ", "")
-    # synopsis
     synopsis = None
     syn = soup.select_one(".sinopsis, .sinopc, .sinopc p, #venkonten .sinopsis, .entry-content .sinopsis")
     if syn:
         synopsis = syn.get_text("\n", strip=True)
-    # poster
     poster = None
     pimg = soup.select_one(".detpost .thumb .thumbz img, .fotoanime img, .post img, meta[property='og:image']")
     if pimg:
@@ -400,9 +301,7 @@ def scrape_anime_detail_by_slug(slug):
             poster = pimg.get("content")
         else:
             poster = pimg.get("src") or pimg.get("data-src")
-    # genres: try mapGenres selector
     genres = [g.get_text(strip=True) for g in soup.select("#venkonten .vezone ul.genres li a, .infozingle a[href*='genres'], .genre-info a, .genres a")]
-    # info fields: parse .infozin .infozingle p elements for Skor/Produser/Tipe/Status
     info = {}
     for p in soup.select(".infozin .infozingle p"):
         txt = p.get_text(" ", strip=True)
@@ -414,7 +313,6 @@ def scrape_anime_detail_by_slug(slug):
             info["type"] = txt.split("Tipe")[-1].replace(":", "").strip()
         if "Status" in txt:
             info["status"] = txt.split("Status")[-1].replace(":", "").strip()
-    # episodes: prefer .episodelist second node (many mirrors use second)
     episodes = []
     episodelists = soup.select(".episodelist")
     chosen = None
@@ -434,14 +332,10 @@ def scrape_anime_detail_by_slug(slug):
                 "link": ep_url,
                 "slug": ep_slug
             })
-    # fallback: try anchors containing '/episode/'
     if not episodes:
         for a in soup.select("a[href*='/episode/'], a[href*='episode']"):
             href = a.get("href")
             episodes.append({"title": a.get_text(strip=True), "link": href, "slug": slug_from_url(href)})
-    
-    logger.info(f"Found {len(episodes)} episodes for anime {slug}")
-    
     data = {
         "title": title,
         "slug": slug,
@@ -452,35 +346,30 @@ def scrape_anime_detail_by_slug(slug):
         "info": info,
         "episodes": episodes
     }
-    save_json(data, f"{slug}.json", OUT_ANIME)
+    save_json(data, filename, OUT_ANIME)
     return data
 
-# -- Episode detail (embed + downloads) --
-# *** KEEPING ALL ORIGINAL SELECTORS AS REQUESTED ***
 def scrape_episode_detail_by_slug(slug):
+    filename = f"{slug}.json"
+    if (OUT_EPISODE / filename).exists():
+        logger.info(f"Skipping episode {slug}: {filename} exists")
+        try:
+            return json.loads((OUT_EPISODE / filename).read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning(f"Corrupt file {filename}, rescraping...")
     url = f"{BASE_URL}/episode/{slug}/"
     soup = soup_from_url(url)
     if not soup:
-        logger.warning(f"Failed to fetch episode detail page for {slug}")
         return None
-        
-    logger.info(f"Successfully fetched episode detail page for {slug}")
-    
-    # title
     title_el = soup.select_one(".venutama .posttl, h1, .post-title")
     title = title_el.get_text(strip=True) if title_el else None
-    # embed iframe: #pembed iframe or any iframe[src]
     iframe = soup.select_one("#pembed iframe, iframe[src], .player iframe")
     embed_url = iframe.get("src") if iframe and iframe.has_attr("src") else None
-    # collect all iframe srcs
     embeds = [i.get("src") for i in soup.select("iframe[src]") if i and i.has_attr("src")]
-    # downloads: .download a, .dlbutton a, .download ul li a
     downloads = []
-    # many pages have <div class="download"> <ul> <li> ... <a> tags
     for container in soup.select(".download, .dlbutton, .downloadlinks"):
         for a in container.select("a[href]"):
             downloads.append({"host": a.get_text(strip=True), "link": a.get("href")})
-    # also try specific list items
     for li in soup.select(".download ul li, .dowload-servers li"):
         qa = li.select_one("strong")
         quality = qa.get_text(strip=True) if qa else None
@@ -489,11 +378,9 @@ def scrape_episode_detail_by_slug(slug):
             links.append({"host": a.get_text(strip=True), "link": a.get("href")})
         if links:
             downloads.append({"quality": quality, "links": links})
-    # try previous/next / anime reference
     flir_anchors = [a.get("href") for a in soup.select(".flir a[href]") if a and a.has_attr("href")]
     anime_url = None
     if flir_anchors:
-        # usually first or second anchor points to anime
         anime_url = flir_anchors[0]
     data = {
         "title": title,
@@ -504,101 +391,77 @@ def scrape_episode_detail_by_slug(slug):
         "downloads": downloads,
         "anime_url": anime_url
     }
-    save_json(data, f"{slug}.json", OUT_EPISODE)
+    save_json(data, filename, OUT_EPISODE)
     return data
 
 # -- Run All flow --
 def run_all():
-    logger.info(">>> Starting scraping process")
     try:
         logger.info(">>> Scraping home (root)")
         scrape_home()
-        
-        logger.info(">>> Scraping ongoing pages (collect unique slugs)")
+    except Exception as e:
+        logger.error(f"Home scrape error: {e}", exc_info=True)
+
+    try:
+        logger.info(">>> Scraping ongoing pages")
         ongoing = scrape_ongoing_pages()
-        
+    except Exception as e:
+        logger.error(f"Ongoing scrape error: {e}", exc_info=True)
+        ongoing = []
+
+    try:
         logger.info(">>> Scraping genre list")
         scrape_genrelist()
-        
+    except Exception as e:
+        logger.error(f"Genre scrape error: {e}", exc_info=True)
+
+    try:
         logger.info(">>> Scraping jadwal rilis")
         scrape_jadwal()
-        
-        # gather slugs to process:
-        slugs = set()
-        # from ongoing
-        for it in ongoing:
-            if it.get("slug"):
-                slugs.add(it["slug"])
-        # from home (root) as well
-        home_items = []
-        hpath = OUT_HOME / "home.json"
-        if hpath.exists():
-            try:
-                home_items = json.loads(hpath.read_text(encoding="utf-8"))
-            except Exception:
-                home_items = []
-        for it in home_items:
-            if isinstance(it, dict) and it.get("slug"):
-                slugs.add(it["slug"])
-        
-        logger.info(f"Collected {len(slugs)} unique slugs. Starting detail scrape...")
-        
-        # scrape anime detail + episodes, then episode details
-        ep_queue = set()
-        i = 0
-        slugs_list = sorted(slugs)
-        
-        for slug in slugs_list:
-            i += 1
-            try:
-                logger.info(f"[{i}/{len(slugs_list)}] Scraping anime detail: {slug}")
-                ad = scrape_anime_detail_by_slug(slug)
-                if not ad:
-                    logger.warning(f"No data returned for anime {slug}")
-                    continue
-                logger.info(f"[{i}/{len(slugs_list)}] Successfully scraped anime detail: {slug} ({len(ad.get('episodes', []))} episodes)")
-                # add episode slugs
-                for ep in ad.get("episodes", []):
-                    if ep.get("slug"):
-                        ep_queue.add(ep["slug"])
-                    else:
-                        # maybe link is full url; derive slug
-                        link = ep.get("link")
-                        if link:
-                            ep_queue.add(slug_from_url(link))
-            except Exception as e:
-                logger.error(f"ERROR scraping anime detail {slug}: {e}")
-                logger.debug(traceback.format_exc())
-        
-        logger.info(f"Episode queue size: {len(ep_queue)}. Scraping episode details ...")
-        ep_queue_list = sorted([s for s in ep_queue if s])
-        j = 0
-        
-        for ep_slug in ep_queue_list:
-            j += 1
-            try:
-                logger.info(f"[{j}/{len(ep_queue_list)}] Scraping episode: {ep_slug}")
-                result = scrape_episode_detail_by_slug(ep_slug)
-                if result:
-                    logger.info(f"[{j}/{len(ep_queue_list)}] Successfully scraped episode: {ep_slug}")
-                else:
-                    logger.warning(f"[{j}/{len(ep_queue_list)}] Failed to scrape episode: {ep_slug}")
-            except Exception as e:
-                logger.error(f"ERROR scraping episode {ep_slug}: {e}")
-                logger.debug(traceback.format_exc())
-        
-        logger.info(">>> ALL DONE")
-    
-    except KeyboardInterrupt:
-        logger.info("Scraping interrupted by user")
     except Exception as e:
-        logger.error(f"Fatal error in scraping process: {e}")
-        logger.debug(traceback.format_exc())
-    finally:
-        # Clean up resources
-        scraper_session.close()
+        logger.error(f"Jadwal scrape error: {e}", exc_info=True)
 
-# -------- Entry point --------
+    slugs = set()
+    for it in ongoing:
+        if it.get("slug"):
+            slugs.add(it["slug"])
+    home_path = OUT_HOME / "home.json"
+    if home_path.exists():
+        try:
+            home_items = json.loads(home_path.read_text(encoding="utf-8"))
+            for it in home_items:
+                if isinstance(it, dict) and it.get("slug"):
+                    slugs.add(it["slug"])
+        except Exception:
+            logger.warning("Failed to load home.json for slugs")
+
+    logger.info(f"Collected {len(slugs)} unique slugs. Starting detail scrape...")
+    ep_queue = set()
+    i = 0
+    for slug in sorted(slugs):
+        i += 1
+        try:
+            logger.info(f"[{i}/{len(slugs)}] Scraping anime detail: {slug}")
+            ad = scrape_anime_detail_by_slug(slug)
+            if ad:
+                for ep in ad.get("episodes", []):
+                    ep_slug = ep.get("slug") or slug_from_url(ep.get("link"))
+                    if ep_slug:
+                        ep_queue.add(ep_slug)
+        except Exception as e:
+            logger.error(f"Anime {slug} error: {e}", exc_info=True)
+
+    logger.info(f"Episode queue size: {len(ep_queue)}. Scraping episode details ...")
+    j = 0
+    for ep_slug in sorted(ep_queue):
+        j += 1
+        try:
+            logger.info(f"[{j}/{len(ep_queue)}] Scraping episode: {ep_slug}")
+            scrape_episode_detail_by_slug(ep_slug)
+        except Exception as e:
+            logger.error(f"Episode {ep_slug} error: {e}", exc_info=True)
+
+    logger.info(">>> ALL DONE")
+
 if __name__ == "__main__":
-    # default: run full all
     run_all()
