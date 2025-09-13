@@ -23,13 +23,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Google Chrome
+      - name: Install Google Chrome and dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget unzip xvfb libxi6 libgconf-2-4
+          sudo apt-get install -y wget unzip xvfb \
+            libxi6 libgconf-2-4 libxss1 libnss3 libasound2 libatk1.0-0 \
+            libatk-bridge2.0-0 libdrm2 libgbm1 libgtk-3-0 libxkbcommon0 \
+            libatspi2.0-0 libxrandr2 libxcomposite1 libxcursor1 libxdamage1 \
+            libxfixes3 libxi6 libxrandr2 libxss1 libxtst6
+          # Download and install Chrome
           wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo dpkg -i google-chrome-stable_current_amd64.deb
-          sudo apt-get -f install -y
+          sudo apt-get -f install -y  # Fix any remaining dependencies
 
       - name: Install ChromeDriver
         run: |
