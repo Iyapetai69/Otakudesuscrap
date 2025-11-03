@@ -6,3 +6,4 @@ requests==2.32.3
 webdriver-manager==4.0.2
 lxml==5.3.0
 stem==1.8.2
+setuptools  # <-- Ini yang nge-fix distutils ghost
