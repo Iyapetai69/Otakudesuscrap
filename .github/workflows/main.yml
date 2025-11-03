@@ -9,18 +9,23 @@ jobs:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
       with: {python-version: '3.12'}
-    - name: Install Tor & Chrome
+    - name: Install Tor
       run: |
         sudo apt update
-        sudo apt install -y tor google-chrome-stable xvfb libnss3 libgconf-2-4 libxss1 libasound2
+        sudo apt install -y tor xvfb
     - name: Config Tor (Control Port Open)
       run: |
         sudo sed -i 's/#ControlPort 9051/ControlPort 9051/' /etc/tor/torrc
         sudo sed -i 's/#HashedControlPassword /HashedControlPassword 16:872860B76453A77D60CA2BB8C1A7042072093276A3D701AD684053EC4C/' /etc/tor/torrc  # Empty pass
         sudo service tor start
-        sleep 10  # Wait Tor boot
+        sleep 15  # Extra wait buat Tor boot stabil
         # Test Tor
         curl --socks5 localhost:9050 https://check.torproject.org/api/ip || echo "Tor ready"
+    - name: Setup Chrome (Auto Deps)
+      uses: browser-actions/setup-chrome@v2
+      with:
+        version: 'latest'  # Chrome terbaru
+        install-dependencies: true  # Auto install nss3, gbm1, dll. – bye libgconf error
     - name: Install Python Deps
       run: |
         pip install -r requirements.txt
