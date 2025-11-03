@@ -1,4 +1,8 @@
+cloudscraper==2.1.1
 beautifulsoup4==4.12.3
-cloudscraper==1.2.71
-requests==2.32.3
 selenium==4.25.0
+undetected-chromedriver==3.5.5
+requests==2.32.3
+webdriver-manager==4.0.2
+lxml==5.3.0
+stem==1.8.2
